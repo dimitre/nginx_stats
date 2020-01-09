@@ -16,7 +16,7 @@ def init():
     c.execute('''CREATE TABLE IF NOT EXISTS ref(id INTEGER PRIMARY KEY,ref text UNIQUE)''')
 
 def gather():
-    for line in open('../error.log'):
+    for line in open('../../error.log'):
         parts = line.split(", ")
         s = """insert OR IGNORE into file (file) values ('""" + str(parts[2]) +"""')"""
         c.execute(s)

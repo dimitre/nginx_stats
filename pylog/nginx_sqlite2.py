@@ -19,7 +19,8 @@ def init():
     c.execute('''CREATE TABLE IF NOT EXISTS ref(id INTEGER PRIMARY KEY,ref text UNIQUE)''')
 
 def gather():
-    for line in open('../access1.log'):
+    for line in open('../../access.log'):
+    #for line in open('../access1.log'):
         try:
             data = p.parse(line)
             print data['%r']
