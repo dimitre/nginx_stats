@@ -36,9 +36,8 @@ st = []
 ctable = {}
 lookfor = re.compile("GET\s/course/([a-z]+)")
 
-
 #
-for line in open('/usr/local/nginx/logs/access.log').xreadlines():
+for line in open('../access.log').xreadlines():
     
   parts = line.split(" ")
 # How much of the name / IP address do we report?

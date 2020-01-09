@@ -14,7 +14,7 @@ def unique(seq, idfun=None):
     return result
 
 #print filenames
-txt = codecs.open('access.log', 'r',"utf-8").read()
+txt = codecs.open('../access.log', 'r',"utf-8").read()
 
 letras = txt[:11100].split(' ')
 unico = unique(letras)
