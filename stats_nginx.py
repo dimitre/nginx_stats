@@ -1,3 +1,5 @@
+# visualizing in plotdevice.io
+
 import codecs
 import operator
 size(800,800)
@@ -35,7 +37,7 @@ val2 = val2[:150]
 #import unicodedata
 #print unicodedata.name(u'ã')
 
-font("HelveticaNeue-Light", h)
+font("HelveticaNeue", h)
 for l,n in val2:
 	w = 500 * n / max
 	rect (0,y,w,h)
