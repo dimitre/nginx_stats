@@ -6,7 +6,7 @@ st = []
 arq = []
 col = 6 #6 / 10
 
-stdin,stdout = os.popen2("tail -n 15000 access.log")
+stdin,stdout = os.popen2("tail -n 15000 ../access.log")
 stdin.close()
 arq = stdout.readlines(); stdout.close();
 
