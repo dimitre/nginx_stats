@@ -7,19 +7,19 @@ conn = sqlite3.connect('database.sqlite')
 c = conn.cursor()
 
 def drop():
-	c.execute('''DROP TABLE logs'''); #file
-	c.execute('''DROP TABLE file'''); #file
-	c.execute('''DROP TABLE ref'''); #file
-def init():    
-	c.execute('''create table IF NOT EXISTS logs (file INTEGER, ref INTEGER)''')
-	c.execute('''CREATE TABLE IF NOT EXISTS file(id INTEGER PRIMARY KEY,file text UNIQUE)''')
-	c.execute('''CREATE TABLE IF NOT EXISTS ref(id INTEGER PRIMARY KEY,ref text UNIQUE)''')
+	c.execute('DROP TABLE IF EXISTS logs');
+	c.execute('DROP TABLE IF EXISTS file');
+	c.execute('DROP TABLE IF EXISTS ref');
+
+def init():
+	c.execute('CREATE table IF NOT EXISTS logs (file INTEGER, ref INTEGER)')
+	c.execute('CREATE TABLE IF NOT EXISTS file (id INTEGER PRIMARY KEY,file text UNIQUE)')
+	c.execute('CREATE TABLE IF NOT EXISTS ref (id INTEGER PRIMARY KEY,ref text UNIQUE)')
 
 def gather():
-	for line in open('../../access.log'):
+	for line in open('../access.log'):
 		parts = line.split(" ")
 		c.execute('INSERT OR IGNORE INTO file (file) values (?)', (str(parts[6]),))
-
 
 		if len(parts) > 10:
 			parts[10] = parts[10].strip('\"')
@@ -34,8 +34,9 @@ def gather():
 			for row in c:
 				ref_id = row[0]
 
-		sql = "insert OR IGNORE into logs values ('" + str(file_id)  + "', '"+ str(ref_id)  +"')"
-		c.execute(sql)
+#		sql = "INSERT OR IGNORE INTO logs VALUES ('" + str(file_id)  + "', '"+ str(ref_id)  +"')"
+#		c.execute(sql)
+		c.execute('INSERT OR IGNORE INTO logs VALUES (?, ?)', (str(file_id), str(ref_id)))
 		
 def find(table,param):
 	sql = "SELECT id from "+table+" WHERE "+table+"='"+param+"'"
