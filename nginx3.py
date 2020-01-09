@@ -9,7 +9,7 @@ st = []
 col = 10
 
 ctable = {}
-for line in open('access.log'):
+for line in open('../access.log'):
     parts = line.split(" ")
 #    print parts, len(parts)
     if len(parts) > col:
