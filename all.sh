@@ -8,4 +8,4 @@ echo 'nginx5'
 ./nginx5.py
 
 echo 'nginx_sqlite.py'
-./nginx5.py
+./nginx_sqlite.py
