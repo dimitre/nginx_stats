@@ -10,15 +10,20 @@ col = 10
 
 ctable = {}
 for line in open('../access.log'):
-    parts = line.split(" ")
+	parts = line.split(" ")
 #    print parts, len(parts)
-    if len(parts) > col:
-        host = parts[col]
-        shorttable[host] = 1 + shorttable.get(host,0)
+	if len(parts) > col:
+		host = parts[col]
+		shorttable[host] = 1 + shorttable.get(host,0)
 
 for s, ss in shorttable.items():
-    st.append ([ss, s])
+	st.append ([ss, s])
 st.sort(reverse=True)
 
-for s, ss in st[:150]:
-    print s,ss
+print
+print('\x1b[6;30;42m' + ' NGINX STATS : access.log top 50 entries ' + '\x1b[0m')
+
+#for s, ss in st[:150]:
+for s, ss in st[:50]:
+	print s,ss
+print 
