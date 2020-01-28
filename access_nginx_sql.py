@@ -9,8 +9,8 @@ c.execute('DROP TABLE IF EXISTS logs');
 c.execute('CREATE table IF NOT EXISTS logs (c1 VARCHAR(255), c2 VARCHAR(255), c3 VARCHAR (255), c4 VARCHAR (255))');
 
 entries = str(130000)
-stdin,stdout = os.popen2("tail -n "+entries+" ../access.log ") #| grep /send.php
-#stdin,stdout = os.popen2("tail -n 20000 ../access.log")
+#stdin,stdout = os.popen2("tail -n "+entries+" ../access.log ") 
+stdin,stdout = os.popen2("cat ../access.log") 
 stdin.close()
 arq = stdout.readlines(); 
 stdout.close();
