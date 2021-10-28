@@ -25,5 +25,5 @@ print('\x1b[6;30;42m' + ' NGINX STATS : access.log top 50 entries ' + '\x1b[0m')
 
 #for s, ss in st[:150]:
 for s, ss in st[:50]:
-	print s,ss
+	print (s,ss)
 print 

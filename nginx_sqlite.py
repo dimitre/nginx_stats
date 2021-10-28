@@ -40,7 +40,7 @@ def gather():
 		
 def find(table,param):
 	sql = "SELECT id from "+table+" WHERE "+table+"='"+param+"'"
-	print sql
+	print (sql)
 	c.execute(sql)
 	for row in c:
 		res = row[0]
@@ -57,7 +57,7 @@ def process(table):
 	c.execute(sql)
 	for row in c:
 		if row[0] > 0:
-			print row[1], item[row[0]]
+			print (row[1], item[row[0]])
 
 def finding(table,name,table2):
 	ref = {}
@@ -72,13 +72,13 @@ def finding(table,name,table2):
 	fileid = find(table,name)
 	if fileid is not None:
 		sql = "SELECT "+table+","+table2+",COUNT(*) AS n from logs WHERE file="+str(fileid)+" GROUP BY ref ORDER BY n DESC LIMIT 50" # ORDER BY file DESC LIMIT 130
-		print sql
+		print (sql)
 		c.execute(sql)
 		for row in c:
 			if row[0] > 0:
-				print row[2], file[row[0]], ref[row[1]]
+				print (row[2], file[row[0]], ref[row[1]])
 	else:
-		print 'result is None'
+		print ('result is None')
 
 drop()
 init()

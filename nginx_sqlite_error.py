@@ -55,7 +55,7 @@ def process(table):
     c.execute(sql)
     for row in c:
         if row[0] > 0:
-            print row[1], item[row[0]]
+            print (row[1], item[row[0]])
 
 def finding(table,name,table2):
     ref = {}
@@ -72,7 +72,7 @@ def finding(table,name,table2):
     c.execute(sql)
     for row in c:
         if row[0] > 0:
-            print row[2], file[row[0]], ref[row[1]]
+            print (row[2], file[row[0]], ref[row[1]])
 
 #drop()
 init()

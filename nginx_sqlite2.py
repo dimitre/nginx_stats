@@ -23,7 +23,7 @@ def gather():
 	#for line in open('../access1.log'):
 		try:
 			data = p.parse(line)
-			print data['%r']
+			print (data['%r'])
 			c.execute("""insert OR IGNORE into file (file) values ('""" + data['%r'] +"""')""")
 			c.execute("""insert OR IGNORE into ref (ref) values ('"""+data['%{Referer}i']+"""')""")
 			file_id = ref_id = 0
@@ -62,7 +62,7 @@ def process(table):
 	c.execute(sql)
 	for row in c:
 		if row[0] > 0:
-			print row[1], item[row[0]]
+			print (row[1], item[row[0]])
 
 def finding(table,name,table2):
 	ref = {}
@@ -79,7 +79,7 @@ def finding(table,name,table2):
 	c.execute(sql)
 	for row in c:
 		if row[0] > 0:
-			print row[2], file[row[0]], ref[row[1]]
+			print (row[2], file[row[0]], ref[row[1]])
 
 drop()
 init()
