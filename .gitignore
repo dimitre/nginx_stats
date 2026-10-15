@@ -1,2 +1,4 @@
 .DS_Store
 *.sqlite
+stats.txt
+stats.md
