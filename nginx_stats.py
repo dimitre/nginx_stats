@@ -186,6 +186,8 @@ class Stats:
         if not bots:
             recs = [r for r in recs if not r[BOT]]
         self.total = len(recs)
+        self.recs = recs
+        self.day_status = Counter()
 
         counters = {name: Counter() for name, _, _ in PANELS[1:]}
         days = defaultdict(lambda: [0, set(), 0])
@@ -213,6 +215,7 @@ class Stats:
             d[1].add(r[IP])
             d[2] += r[BYTES]
             self.hours[r[DAY], r[HOUR]] += 1
+            self.day_status[r[DAY], r[STATUS] // 100] += 1
             self.status[r[STATUS] // 100] += 1
             self.bytes += r[BYTES]
             ips.add(r[IP])
@@ -600,6 +603,125 @@ def report(app, top):
             print(f'{n:>10,} {pct(n, total)}  ' + green(hbar(n, peak, 20).ljust(20)) + f'  {label(field, value)}')
 
 
+# --- dump for reading by an LLM --------------------------------------------
+
+def dump(app, top, path):
+    """Markdown with everything distilled, to paste into an LLM for opinions."""
+    st = app.stats
+    out = []
+    w = out.append
+
+    def cell(v):
+        v = label(None, v).replace('|', '\\|')
+        return v if len(v) <= 160 else v[:157] + '...'
+
+    def table(head, rows, text_cols=1):
+        w('| ' + ' | '.join(head) + ' |')
+        w('|' + '|'.join('---:' if i < len(head) - text_cols else '---' for i in range(len(head))) + '|')
+        for r in rows:
+            w('| ' + ' | '.join(cell(v) if isinstance(v, str) else f'{v:,}' if isinstance(v, int) else str(v)
+                                for v in r) + ' |')
+        w('')
+
+    def ranked(rows, total, n=top):
+        return [(c, pct(c, total).strip(), v) for v, c in rows[:n]]
+
+    days = list(st.days)
+    w(f'# nginx access stats: {app.source}')
+    w('')
+    w(f'Generated {datetime.datetime.now():%Y-%m-%d %H:%M} by nginx_stats from {len(app.files)} log files '
+      f'of a small web server hosting several personal and portfolio sites.')
+    w('')
+    w('- Requests are counted per log line. Bots (crawlers, scanners, curl, scripts, empty user agent) '
+      'are detected by user-agent keywords; browsers faking their agent count as people.')
+    w('- ' + ('Bots are included in all tables.' if app.bots else
+              f'Bots are left out of the main tables ({st.bots:,} requests); they have their own section at the end.'))
+    if app.pages:
+        w('- Static files (css, js, images, fonts) are left out.')
+    if app.filters:
+        w('- Only requests with ' + ', '.join(f'{FIELD_NAMES[f]} = {label(f, v)}' for f, v in app.filters) + '.')
+    w('- URLs are paths without query strings. "Sites" and "Referrers" are external referrers only.')
+    w(f'- Tables show the top {top} rows; the total number of distinct values is in each heading.')
+    w('')
+
+    w('## Summary')
+    w('')
+    w(f'- Period: {days[0]} to {days[-1]} ({len(days)} days)' if days else '- Period: none')
+    w(f'- Requests: {st.total:,}; unique IPs: {st.ips:,}; data sent: {human(st.bytes)}')
+    w('- Status: ' + ', '.join(f'{c}xx {pct(st.status.get(c, 0), st.total).strip()}' for c in (2, 3, 4, 5)))
+    w(f'- Unparseable log lines: {app.bad:,}')
+    w('')
+    if not st.total:
+        return finish(out, path)
+
+    w('## Per day')
+    w('')
+    table(['requests', 'unique IPs', 'data', '4xx', '5xx', 'day'],
+          [(n, ips, human(size), st.day_status.get((d, 4), 0), st.day_status.get((d, 5), 0), d)
+           for d, (n, ips, size) in st.days.items()])
+
+    w('## Hour of day (all days added up, server local time)')
+    w('')
+    by_hour = Counter()
+    for (_, h), n in st.hours.items():
+        by_hour[h] += n
+    table(['requests', '%', 'hour'], [(by_hour[h], pct(by_hour[h], st.total).strip(), f'{h:02d}:00') for h in range(24)])
+
+    w(f'## Sites hosted ({len(st.rows["Hosts"]):,})')
+    w('')
+    hosts = defaultdict(lambda: [0, set(), 0, 0, Counter()])
+    for r in st.recs:
+        h = hosts[r[HOST]]
+        h[0] += 1
+        h[1].add(r[IP])
+        h[2] += r[STATUS] >= 400
+        h[3] += r[BYTES]
+        if r[STATUS] < 400 and not r[ASSET]:
+            h[4][r[PATH]] += 1
+    rows = sorted(hosts.items(), key=lambda kv: -kv[1][0])[:top]
+    table(['requests', 'unique IPs', 'errors %', 'data', 'host', 'most visited pages'],
+          [(n, len(ips), pct(err, n).strip(), human(size), host,
+            ', '.join(f'{p} ({c:,})' for p, c in pages.most_common(3)))
+           for host, (n, ips, err, size, pages) in rows], text_cols=2)
+
+    for name, field, _ in PANELS[2:]:
+        if name == 'Hosts':
+            continue
+        rows = st.rows[name]
+        if not rows:
+            continue
+        title = {'Sites': 'Referring sites (external)', 'Referrers': 'Referrers (external, full URL)',
+                 '404s': 'Not found (404) URLs', 'IPs': 'Client IPs', 'Agents': 'User agents'}.get(name, name)
+        w(f'## {title} ({len(rows):,})')
+        w('')
+        table(['requests', '%', FIELD_NAMES[field]], ranked(rows, st.rows[name + ' total']))
+
+    if not app.bots and st.bots:
+        bots = Stats(app.records, app.filters + [(BOT, True)], True, app.pages)
+        w(f'## Bots ({bots.total:,} requests, {bots.ips:,} IPs)')
+        w('')
+        w('- Status: ' + ', '.join(f'{c}xx {pct(bots.status.get(c, 0), bots.total).strip()}' for c in (2, 3, 4, 5)))
+        w('')
+        n = max(top // 2, 10)
+        for name, title in (('Agents', 'Bot user agents'), ('URLs', 'URLs bots asked for'),
+                            ('404s', 'Not found URLs bots asked for (probes)'), ('IPs', 'Bot IPs')):
+            w(f'### {title} ({len(bots.rows[name]):,})')
+            w('')
+            table(['requests', '%', FIELD_NAMES[PANELS[[p[0] for p in PANELS].index(name)][1]]],
+                  ranked(bots.rows[name], bots.rows[name + ' total'], n))
+    return finish(out, path)
+
+
+def finish(lines, path):
+    text = '\n'.join(lines) + '\n'
+    if path == '-':
+        sys.stdout.write(text)
+    else:
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(text)
+        print(f'wrote {path} ({len(text) / 1024:.0f} KB, about {len(text) // 4:,} tokens)', file=sys.stderr)
+
+
 # --- main ------------------------------------------------------------------
 
 class App:
@@ -639,7 +761,9 @@ def main():
     ap.add_argument('--bots', action='store_true', help='include crawlers, scanners and scripts')
     ap.add_argument('--pages', action='store_true', help='leave out static files (css, js, images, fonts)')
     ap.add_argument('--text', action='store_true', help='print a report instead of the interactive view')
-    ap.add_argument('--top', type=int, default=20, help='rows per table in --text (default: 20)')
+    ap.add_argument('--dump', metavar='FILE', help='write everything distilled as Markdown for an LLM '
+                    '(- for stdout) instead of the interactive view')
+    ap.add_argument('--top', type=int, help='rows per table (default: 20 in --text, 50 in --dump)')
     args = ap.parse_args()
 
     files = log_files(args.logs, args.dir)
@@ -661,8 +785,11 @@ def main():
     UNICODE = 'UTF' in locale.getpreferredencoding().upper()
 
     app = App(files, args.days, filters, args.bots, args.pages, source)
+    if args.dump:
+        dump(app, args.top or 50, args.dump)
+        return
     if args.text or not sys.stdout.isatty():
-        report(app, args.top)
+        report(app, args.top or 20)
         return
 
     os.environ.setdefault('ESCDELAY', '25')
