@@ -16,7 +16,18 @@ so it runs from anywhere, e.g. `/srv/server/nginx_stats`.
 ./nginx_stats.py --text --url /lunar/view.php --bots   # who hit this file
 ```
 
-Other folder: `--dir /path` or `NGINX_LOG_DIR=/path`.
+Several sources are read together, e.g. current logs plus another server's:
+
+```sh
+./nginx_stats.py /var/log/nginx /srv/logs/oldserver     # folders: their access.log*
+./nginx_stats.py /var/log/nginx/access.log* /srv/logs/oldserver/*.gz
+```
+
+Each source is a log name in `--dir` (`access`, `blocked`), a folder, a file
+or a glob. A file reached twice is read once. Keep other servers' logs out of
+`/var/log/nginx`: logrotate renames and deletes numbered files there.
+
+Default folder: `--dir /path` or `NGINX_LOG_DIR=/path`.
 
 ## Interactive keys
 

@@ -8,6 +8,7 @@ standard library only, so it runs as is on any server.
 
     ./nginx_stats.py                       interactive, access.log*
     ./nginx_stats.py blocked               blocked.log*
+    ./nginx_stats.py /var/log/nginx /srv/logs/oldserver   both folders together
     ./nginx_stats.py --days 1 --host dmtr.org
     ./nginx_stats.py --text --top 30       plain report (cron, mail, pipes)
 """
@@ -122,14 +123,31 @@ class Parser:
                 self.bots[ua], bool(STATIC.search(path)))
 
 
-def log_files(name, directory):
-    pattern = name if os.sep in name else os.path.join(directory, name + '.log*')
-
+def log_files(sources, directory):
+    """Files for each source: a name in directory (access, blocked), a folder
+    (its access.log*), a file or a glob. Oldest rotation first, no repeats."""
     def rotation(f):
         m = re.search(r'\.(\d+)(\.gz)?$', f)
         return int(m.group(1)) if m else 0
 
-    return sorted(glob.glob(pattern), key=rotation, reverse=True)    # oldest first
+    files, seen = [], set()
+    for src in sources:
+        if os.path.isdir(src):
+            found = glob.glob(os.path.join(src, 'access.log*'))
+        elif os.path.isfile(src):
+            found = [src]
+        elif os.sep in src:
+            found = glob.glob(src)
+        else:
+            found = glob.glob(os.path.join(directory, src + '.log*'))
+        if not found:
+            print(f'nothing found for {src!r}', file=sys.stderr)
+        for f in sorted(found, key=rotation, reverse=True):
+            real = os.path.realpath(f)
+            if real not in seen and os.path.isfile(f):
+                seen.add(real)
+                files.append(f)
+    return files
 
 
 def load(files, days=None, progress=None):
@@ -609,8 +627,9 @@ def main():
         epilog='interactive keys:\n  ' + KEYS + '\n\n'
                'Lines must be in nginx "combined" format, optionally followed by\n'
                '"$http_x_forwarded_for" and/or "$host" (log_format main in _nginx/hifolio.conf).')
-    ap.add_argument('log', nargs='?', default='access',
-                    help='log name in --dir (access, blocked) or a path/glob (default: access)')
+    ap.add_argument('logs', nargs='*', default=['access'],
+                    help='log names in --dir (access, blocked), folders (their access.log*), '
+                         'files or globs; several are read together (default: access)')
     ap.add_argument('--dir', default=LOG_DIR, help=f'log folder (default: {LOG_DIR}, or $NGINX_LOG_DIR)')
     ap.add_argument('--days', type=int, help='only the last N days')
     ap.add_argument('--host', help='only this site, e.g. dmtr.org')
@@ -623,13 +642,17 @@ def main():
     ap.add_argument('--top', type=int, default=20, help='rows per table in --text (default: 20)')
     args = ap.parse_args()
 
-    files = log_files(args.log, args.dir)
+    files = log_files(args.logs, args.dir)
     if not files:
-        sys.exit(f'no log files for {args.log!r} in {args.dir}')
+        sys.exit('no log files found')
     filters = [(f, v) for f, v in ((HOST, args.host and args.host.lower()), (PATH, args.url),
                                    (IP, args.ip), (STATUS, args.status)) if v is not None]
-    name = os.path.basename(files[-1])
-    source = f'{name}*' if len(files) > 1 else name
+    folders = {os.path.dirname(os.path.realpath(f)) for f in files}
+    if len(folders) > 1:
+        source = f'{len(files)} files in {len(folders)} folders'
+    else:
+        name = os.path.basename(files[-1])
+        source = f'{name}*' if len(files) > 1 else name
     if args.days:
         source += f'  last {args.days} day' + ('s' if args.days > 1 else '')
 
