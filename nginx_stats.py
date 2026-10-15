@@ -6,8 +6,8 @@ Reads every rotated file (access.log, access.log.1, access.log.2.gz...) in
 /var/log/nginx and opens an interactive view in the terminal. Python 3
 standard library only, so it runs as is on any server.
 
-    ./nginx_stats.py                       interactive, access.log*
-    ./nginx_stats.py blocked               blocked.log*
+    ./nginx_stats.py                       interactive, access.log* + blocked.log*
+    ./nginx_stats.py access                only access.log* (blocked: only blocked.log*)
     ./nginx_stats.py /var/log/nginx /srv/logs/oldserver   both folders together
     ./nginx_stats.py --days 1 --host dmtr.org
     ./nginx_stats.py --text --top 30       plain report (cron, mail, pipes)
@@ -24,14 +24,18 @@ import ipaddress
 import locale
 import os
 import re
+import shutil
+import subprocess
 import sys
 from collections import Counter, defaultdict
 from urllib.parse import urlsplit
 
 LOG_DIR = os.environ.get('NGINX_LOG_DIR', '/var/log/nginx')
 HERE = os.path.dirname(os.path.realpath(__file__))
-# where server_name lines tell real sites from host names made up by scanners
-NGINX_CONF = ['/etc/nginx', os.path.join(HERE, '..', '_nginx')]
+# where server_name lines tell real sites from host names made up by scanners:
+# `nginx -T` (root), else nginx.conf and its includes, else our repo's _nginx/
+NGINX_MAIN = '/etc/nginx/nginx.conf'
+NGINX_REPO = os.path.join(HERE, '..', '_nginx')
 
 # combined format, then optional extra quoted fields. Ours (log_format main):
 # ... "$http_user_agent" "$http_x_forwarded_for" "$host"
@@ -50,11 +54,13 @@ BOTS = re.compile(
     r'bot|crawl|spider|slurp|scan|curl|wget|python|go-http|java/|libwww|perl|ruby|php/|okhttp|axios|'
     r'node-fetch|httpclient|http-client|headless|lighthouse|facebookexternalhit|preview|feed|monitor|'
     r'uptime|zgrab|masscan|nmap|nikto|sqlmap|ahrefs|semrush|mj12|dataprovider|censys|expanse|palo alto|'
-    r'worker|fetch|proxy', re.I)
+    r'worker|fetch|proxy|finder', re.I)
 DECLARED = re.compile(r'https?://|@|\bcompatible;', re.I)      # bots sign with a url or e-mail
 BROWSER = re.compile(r'Safari/|Firefox/|Mobile/')              # every real browser has one
-VERSION = re.compile(r'(Chrome|Firefox)/(\d+)')
-OUTDATED = 18           # versions behind the newest one in the logs (about 1.5 years)
+VERSION = re.compile(r'(Chrome|Firefox)/(\d+)|(?:iPhone|CPU) OS (\d+)_')
+# versions behind the newest one in the logs: Chrome/Firefox about 1.5 years, iOS 4 years
+# (iOS 26 still says "OS 18_7", so the newest is 18 and 13_2_3, a common fake, is out)
+OUTDATED = {'Chrome': 18, 'Firefox': 18, 'iOS': 4}
 PROBES = re.compile(
     r'/\.(?:env|git|svn|hg|aws|ssh|docker|vscode|idea|DS_Store|htpasswd|htaccess|npmrc|bash_history)|'
     r'wp-(?:login|admin|content|includes|config|json)|xmlrpc\.php|phpinfo|php-info|eval-stdin|'
@@ -65,7 +71,8 @@ REASONS = {
     'bot user agent': 'says it is a bot or tool (bot, crawler, curl, python, a +http contact link...)',
     'not a browser': 'user agent does not start with Mozilla/ (WordPress/, libredtail-http, crusader-worker...)',
     'fake browser agent': 'starts with Mozilla/ but has no browser in it (bare "Mozilla/5.0", Chrome without Safari/...)',
-    'outdated browser': f'Chrome or Firefox {OUTDATED}+ versions behind the newest one in these logs',
+    'blocked by nginx': 'in blocked.log: closed (444) or refused by nginx (bad user agent, probe URL, unknown host, dotfile...)',
+    'outdated browser': 'Chrome or Firefox 18+ versions behind the newest one in these logs, or iOS 4+ behind',
     'empty user agent': 'no user agent at all',
     'probing IP': 'IP that asked for .env, .git, wp-login, phpinfo... (all its requests count)',
     'error-heavy IP': 'IP with 20+ requests, 80%+ of them 4xx',
@@ -73,7 +80,7 @@ REASONS = {
 }
 
 # record fields
-IP, DAY, HOUR, METHOD, PATH, STATUS, BYTES, REF, SITE, UA, HOST, ASSET = range(12)
+IP, DAY, HOUR, METHOD, PATH, STATUS, BYTES, REF, SITE, UA, HOST, ASSET, NET, BLOCKED = range(14)
 
 # name, record field, sort by key instead of count
 PANELS = [
@@ -88,9 +95,10 @@ PANELS = [
     ('404s', PATH, False),
     ('IPs', IP, False),
     ('Agents', UA, False),
+    ('Networks', NET, False),      # /24 (IPv4), /64 (IPv6): one machine or one provider's block
 ]
 BYTE_PANELS = {'Data'}
-FIELD_NAMES = {DAY: 'day', PATH: 'url', HOST: 'host', SITE: 'site', REF: 'ref', STATUS: 'status', IP: 'ip', UA: 'agent'}
+FIELD_NAMES = {DAY: 'day', PATH: 'url', HOST: 'host', SITE: 'site', REF: 'ref', STATUS: 'status', IP: 'ip', UA: 'agent', NET: 'network'}
 
 
 # --- reading ---------------------------------------------------------------
@@ -110,9 +118,21 @@ def www(host):
     return host[4:] if host.startswith('www.') else host
 
 
+def network(ip):
+    """/24 for IPv4, /64 for IPv6 (one home connection or one server)."""
+    if ':' in ip:
+        try:
+            return str(ipaddress.ip_network(ip + '/64', strict=False))
+        except ValueError:
+            return ip
+    parts = ip.split('.')
+    return '.'.join(parts[:3]) + '.0/24' if len(parts) == 4 else ip
+
+
 class Parser:
     def __init__(self):
         self.sites = {}
+        self.nets = {}
 
     def site(self, ref):
         if ref not in self.sites:
@@ -123,7 +143,7 @@ class Parser:
             self.sites[ref] = sys.intern(www(host))
         return self.sites[ref]
 
-    def parse(self, line):
+    def parse(self, line, blocked=False):
         vhost = ''
         m = LINE.match(line)
         if not m:
@@ -172,9 +192,13 @@ class Parser:
             s = self.site(ref)
             if s and s != www(host):
                 site = s
-        return (sys.intern(ip), sys.intern(day), int(hour), sys.intern(method), path, int(status),
+        ip = sys.intern(ip)
+        net = self.nets.get(ip)
+        if net is None:
+            net = self.nets[ip] = sys.intern(network(ip))
+        return (ip, sys.intern(day), int(hour), sys.intern(method), path, int(status),
                 0 if size == '-' else int(size), sys.intern(ref), site, sys.intern(ua), host,
-                bool(STATIC.search(path)))
+                bool(STATIC.search(path)), net, blocked)
 
 
 # --- lines that could not be read ---
@@ -252,9 +276,10 @@ class Unparsed:
                 for sh, c in self.shapes.most_common(n)]
 
 
-def log_files(sources, directory):
+def log_files(sources, directory, optional=()):
     """Files for each source: a name in directory (access, blocked), a folder
-    (its access.log*), a file or a glob. Oldest rotation first, no repeats."""
+    (its access.log* and blocked.log*), a file or a glob. Oldest rotation first,
+    no repeats. Sources in optional may be missing without a warning."""
     def rotation(f):
         m = re.search(r'\.(\d+)(\.gz)?$', f)
         return int(m.group(1)) if m else 0
@@ -262,14 +287,14 @@ def log_files(sources, directory):
     files, seen = [], set()
     for src in sources:
         if os.path.isdir(src):
-            found = glob.glob(os.path.join(src, 'access.log*'))
+            found = glob.glob(os.path.join(src, 'access.log*')) + glob.glob(os.path.join(src, 'blocked.log*'))
         elif os.path.isfile(src):
             found = [src]
         elif os.sep in src:
             found = glob.glob(src)
         else:
             found = glob.glob(os.path.join(directory, src + '.log*'))
-        if not found:
+        if not found and src not in optional:
             print(f'nothing found for {src!r}', file=sys.stderr)
         for f in sorted(found, key=rotation, reverse=True):
             real = os.path.realpath(f)
@@ -290,9 +315,10 @@ def load(files, days=None, progress=None):
             if progress:
                 progress(f)
             opener = gzip.open if f.endswith('.gz') else open
+            blocked = os.path.basename(f).startswith('blocked')
             with opener(f, 'rt', encoding='utf-8', errors='replace') as fh:
                 for line in fh:
-                    r = parser.parse(line)
+                    r = parser.parse(line, blocked)
                     if r:
                         records.append(r)
                         good += 1
@@ -312,26 +338,65 @@ def load(files, days=None, progress=None):
 # --- known sites -----------------------------------------------------------
 
 class KnownHosts:
-    """Host names from server_name lines in the nginx config."""
-    def __init__(self, places):
+    """Host names from server_name lines in the nginx config: the full config
+    from `nginx -T` (needs root), else nginx.conf and every file it includes,
+    else the *.conf files in our repo's _nginx/ (when run on a copy of the logs)."""
+    def __init__(self):
         self.exact, self.suffix, self.prefix, self.regex = set(), [], [], []
-        self.files = []
-        for place in places:
-            paths = (glob.glob(os.path.join(place, '**', '*.conf'), recursive=True)
-                     + glob.glob(os.path.join(place, 'sites-enabled', '*'))) if os.path.isdir(place) else []
-            if place.endswith('_nginx'):    # our repo: only the live top level, not _fusk/ etc.
-                paths = glob.glob(os.path.join(place, '*.conf'))
-            for p in paths:
-                try:
-                    text = open(p, encoding='utf-8', errors='replace').read()
-                except OSError:
-                    continue
-                names = re.findall(r'^[ \t]*server_name\s+([^;]+);', text, re.M)
-                if names:
-                    self.files.append(p)
-                for name in ' '.join(names).split():
-                    self.add(name.lower())
+        self.files, self.source = [], ''
+        text = self.nginx_t()
+        if text:
+            self.source = 'nginx -T'
+            self.files = re.findall(r'^# configuration file (.+):$', text, re.M)
+            self.names(text)
+        else:
+            self.follow(NGINX_MAIN, set())
+            self.source = NGINX_MAIN + ' and its includes'
+        if not self and os.path.isdir(NGINX_REPO):
+            self.source = os.path.normpath(NGINX_REPO)
+            for p in sorted(glob.glob(os.path.join(NGINX_REPO, '*.conf'))):
+                self.read(p)
         self.cache = {}
+
+    @staticmethod
+    def nginx_t():
+        exe = shutil.which('nginx') or ('/usr/sbin/nginx' if os.path.exists('/usr/sbin/nginx') else None)
+        if not exe:
+            return ''
+        try:
+            out = subprocess.run([exe, '-T'], capture_output=True, text=True, timeout=30)
+        except (OSError, subprocess.SubprocessError):
+            return ''
+        return out.stdout if out.returncode == 0 else ''
+
+    def names(self, text):
+        text = re.sub(r'#[^\n]*', '', text)
+        found = re.findall(r'(?:^|[;{}\s])server_name\s+([^;]+);', text)
+        for name in ' '.join(found).split():
+            self.add(name.lower())
+        return text, bool(found)
+
+    def read(self, path):
+        try:
+            text = open(path, encoding='utf-8', errors='replace').read()
+        except OSError:
+            return ''
+        text, found = self.names(text)
+        if found:
+            self.files.append(path)
+        return text
+
+    def follow(self, pattern, seen):
+        if not os.path.isabs(pattern):
+            pattern = os.path.join(os.path.dirname(NGINX_MAIN), pattern)
+        for path in sorted(glob.glob(pattern)):
+            real = os.path.realpath(path)
+            if real in seen or not os.path.isfile(path):
+                continue
+            seen.add(real)
+            text = self.read(path)
+            for inc in re.findall(r'(?:^|[;{}\s])include\s+([^;]+);', text):
+                self.follow(inc.strip().strip('"\''), seen)
 
     def add(self, name):
         if name in ('_', '""'):
@@ -366,16 +431,24 @@ class KnownHosts:
 
 # --- bots ------------------------------------------------------------------
 
+def browser_version(ua):
+    """('Chrome', 150), ('iOS', 18)... or None."""
+    m = VERSION.search(ua)
+    if not m:
+        return None
+    return (m.group(1), int(m.group(2))) if m.group(1) else ('iOS', int(m.group(3)))
+
+
 def newest_versions(records):
-    """Newest Chrome and Firefox with a real share of the traffic (2%+), so a
+    """Newest Chrome, Firefox and iOS with a real share of the traffic (2%+), so a
     few fake future versions can't make every real browser look outdated."""
     agents = Counter(r[UA] for r in records)
     families = defaultdict(Counter)
     for ua, n in agents.items():
         if ua.startswith('Mozilla/') and not BOTS.search(ua):
-            m = VERSION.search(ua)
-            if m:
-                families[m.group(1)][int(m.group(2))] += n
+            v = browser_version(ua)
+            if v:
+                families[v[0]][v[1]] += n
     newest = {}
     for name, versions in families.items():
         total = sum(versions.values())
@@ -396,8 +469,8 @@ def ua_reason(ua, newest):
         return 'not a browser'
     if not BROWSER.search(ua):
         return 'fake browser agent'
-    m = VERSION.search(ua)
-    if m and m.group(1) in newest and int(m.group(2)) < newest[m.group(1)] - OUTDATED:
+    v = browser_version(ua)
+    if v and v[0] in newest and v[1] < newest[v[0]] - OUTDATED[v[0]]:
         return 'outdated browser'
     return None
 
@@ -426,7 +499,8 @@ def classify(records):
         why = agents.get(ua, 0)
         if why == 0:
             why = agents[ua] = ua_reason(ua, newest)
-        reasons.append(why or ips.get(r[IP]) or ('malformed request' if r[METHOD] == '-' else None))
+        reasons.append(('blocked by nginx' if r[BLOCKED] else why) or ips.get(r[IP])
+                       or ('malformed request' if r[METHOD] == '-' else None))
     return reasons, ips, newest
 
 
@@ -458,8 +532,8 @@ class Stats:
         ips = set()
         days_c, urls, data, hosts, sites = (counters['Days'], counters['URLs'], counters['Data'],
                                             counters['Hosts'], counters['Sites'])
-        refs, status, notfound, ipc, uas = (counters['Referrers'], counters['Status'], counters['404s'],
-                                            counters['IPs'], counters['Agents'])
+        refs, status, notfound, ipc, uas, nets = (counters['Referrers'], counters['Status'], counters['404s'],
+                                                  counters['IPs'], counters['Agents'], counters['Networks'])
         for r in recs:
             days_c[r[DAY]] += 1
             urls[r[PATH]] += 1
@@ -468,6 +542,7 @@ class Stats:
             status[r[STATUS]] += 1
             ipc[r[IP]] += 1
             uas[r[UA]] += 1
+            nets[r[NET]] += 1
             if r[SITE]:
                 sites[r[SITE]] += 1
                 refs[r[REF]] += 1
@@ -931,6 +1006,22 @@ def dump(app, top, path):
     def matches(r):
         return all(r[f] == v for f, v in app.filters) and not (app.pages and r[ASSET])
 
+    def main_sites(recs, paths):
+        """Host that got most requests for each path ("+2": two other hosts too)."""
+        by = defaultdict(Counter)
+        for r in recs:
+            if r[PATH] in paths:
+                by[r[PATH]][r[HOST]] += 1
+        return {p: (c.most_common(1)[0][0] or '-') + (f' +{len(c) - 1}' if len(c) > 1 else '')
+                for p, c in by.items()}
+
+    def net_ips(recs, nets):
+        by = defaultdict(set)
+        for r in recs:
+            if r[NET] in nets:
+                by[r[NET]].add(r[IP])
+        return {n: len(v) for n, v in by.items()}
+
     days = list(st.days)
     w(f'# nginx access stats: {app.source}')
     w('')
@@ -947,6 +1038,10 @@ def dump(app, top, path):
     if app.filters:
         w('- Only requests with ' + ', '.join(f'{FIELD_NAMES[f]} = {label(f, v)}' for f, v in app.filters) + '.')
     w('- URLs are paths without query strings. "Sites" and "Referrers" are external referrers only.')
+    w('- Lines from blocked.log are requests nginx refused (444 or 404): bad user agents, probe URLs, '
+      'unknown host names, dotfiles. They count as bots ("blocked by nginx").')
+    w('- Networks group IPs by /24 (IPv4) or /64 (IPv6): one home connection, or neighbouring servers '
+      'of one provider.')
     w(f'- Tables show the top {top} rows; the total number of distinct values is in each heading.')
     w('')
 
@@ -997,7 +1092,8 @@ def dump(app, top, path):
     w(f'## Sites hosted ({len(known):,})')
     w('')
     if app.known:
-        w(f'Host names found in server_name lines of the nginx config ({len(app.known.files)} files). '
+        w(f'Host names found in server_name lines of the nginx config ({app.known.source}, '
+          f'{len(app.known.files)} files). '
           f'Requests for other names are grouped in the last row and listed in "Unknown host names".')
     else:
         w('No nginx config found, so every host name is listed, including names made up by scanners.')
@@ -1041,13 +1137,19 @@ def dump(app, top, path):
             continue
         title = {'Sites': 'Referring sites (external)', 'Referrers': 'Referrers (external, full URL)',
                  'Data': 'Data sent per URL', '404s': 'Not found (404) URLs', 'IPs': 'Client IPs',
-                 'Agents': 'User agents'}.get(name, name)
+                 'Agents': 'User agents', 'Networks': 'Networks (/24, /64)'}.get(name, name)
         w(f'## {title} ({len(rows):,})')
         w('')
         if name in BYTE_PANELS:
             urls = dict(st.rows['URLs'])
-            table(['data', '%', 'requests', 'url'],
-                  [(human(b), pct(b, st.rows[name + ' total']).strip(), urls.get(v, 0), v) for v, b in rows[:top]])
+            main = main_sites(st.recs, {v for v, _ in rows[:top]})
+            table(['data', '%', 'requests', 'url', 'main site'],
+                  [(human(b), pct(b, st.rows[name + ' total']).strip(), urls.get(v, 0), v, main.get(v, ''))
+                   for v, b in rows[:top]], text_cols=2)
+        elif name == 'Networks':
+            ips = net_ips(st.recs, {v for v, _ in rows[:top]})
+            table(['requests', '%', 'IPs', 'network'],
+                  [(c, pct(c, st.rows[name + ' total']).strip(), ips.get(v, 0), v) for v, c in rows[:top]])
         else:
             table(['requests', '%', FIELD_NAMES[field]], ranked(rows, st.rows[name + ' total']))
 
@@ -1063,8 +1165,10 @@ def dump(app, top, path):
             w(f'### {title} ({len(bots.rows[name]):,})')
             w('')
             if name in BYTE_PANELS:
-                table(['data', '%', 'url'], [(human(b), pct(b, bots.rows[name + ' total']).strip(), v)
-                                             for v, b in bots.rows[name][:n]])
+                main = main_sites(bots.recs, {v for v, _ in bots.rows[name][:n]})
+                table(['data', '%', 'url', 'main site'],
+                      [(human(b), pct(b, bots.rows[name + ' total']).strip(), v, main.get(v, ''))
+                       for v, b in bots.rows[name][:n]], text_cols=2)
             else:
                 field = dict((p[0], p[1]) for p in PANELS)[name]
                 table(['requests', '%', FIELD_NAMES[field]], ranked(bots.rows[name], bots.rows[name + ' total'], n))
@@ -1073,7 +1177,55 @@ def dump(app, top, path):
         table(['requests', '%', 'ip', 'flagged as'],
               [(c, pct(c, bots.rows['IPs total']).strip(), ip, app.flagged_ips.get(ip, 'by user agent'))
                for ip, c in bots.rows['IPs'][:n]], text_cols=2)
+        w(f'### Bot networks ({len(bots.rows["Networks"]):,})')
+        w('')
+        w('Many IPs in one network with similar counts: one operator spreading its requests.')
+        w('')
+        ips = net_ips(bots.recs, {v for v, _ in bots.rows['Networks'][:n]})
+        table(['requests', '%', 'IPs', 'network'],
+              [(c, pct(c, bots.rows['Networks total']).strip(), ips.get(v, 0), v) for v, c in bots.rows['Networks'][:n]])
+        candidates(app, matches, n, table, w)
     return finish(out, path, app)
+
+
+def candidates(app, matches, n, table, w):
+    """Bot traffic nginx still answers: what to add to bots.conf, probes.conf or ufw next."""
+    agents = defaultdict(lambda: [0, 0, 0, Counter()])
+    ips = defaultdict(lambda: [0, 0, 0, Counter()])
+    nets = defaultdict(lambda: [0, 0, 0, Counter(), set()])
+    for r, why in zip(app.records, app.reasons):
+        if not why or r[BLOCKED] or not matches(r):
+            continue
+        for d, key in ((agents, r[UA]), (ips, r[IP]), (nets, r[NET])):
+            v = d[key]
+            v[0] += 1
+            v[1] += r[STATUS] < 400
+            v[2] += r[BYTES]
+            v[3][why] += 1
+        nets[r[NET]][4].add(r[IP])
+    if not agents:
+        return
+    total = sum(v[0] for v in agents.values())
+    w(f'## Still answered for bots: candidates for blocking ({total:,} requests)')
+    w('')
+    w('Bot requests that reached the sites (not in blocked.log). "served %" = answered 2xx/3xx. '
+      'Search engines and the AI crawlers left out of ai_bots.conf are here on purpose; the rest are '
+      'candidates for nginx (bots.conf by user agent, probes.conf by URL) or the firewall (IPs, networks).')
+    w('')
+
+    def rows(d, extra=False):
+        top = sorted(d.items(), key=lambda kv: -kv[1][0])[:n]
+        return [(v[0], pct(v[1], v[0]).strip(), human(v[2]))
+                + ((len(v[4]),) if extra else ()) + (v[3].most_common(1)[0][0], k) for k, v in top]
+    w('### By user agent')
+    w('')
+    table(['requests', 'served %', 'data', 'reason', 'agent'], rows(agents), text_cols=2)
+    w('### By network')
+    w('')
+    table(['requests', 'served %', 'data', 'IPs', 'reason', 'network'], rows(nets, True), text_cols=2)
+    w('### By IP')
+    w('')
+    table(['requests', 'served %', 'data', 'reason', 'ip'], rows(ips), text_cols=2)
 
 
 def finish(out, path, app):
@@ -1124,7 +1276,7 @@ class App:
         self.files, self.days, self.filters = files, days, filters
         self.bots, self.pages, self.source = bots, pages, source
         self.quiet = quiet
-        self.known = KnownHosts(NGINX_CONF)
+        self.known = KnownHosts()
         self.reload()
 
     def reload(self):
@@ -1147,14 +1299,15 @@ def main():
                'Lines in nginx "combined" format, optionally followed by "$http_x_forwarded_for"\n'
                'and/or "$host" (log_format main in _nginx/hifolio.conf). Also read: "common"\n'
                'format, a host name before the IP, \\" escapes and $time_iso8601.')
-    ap.add_argument('logs', nargs='*', default=['access'],
-                    help='log names in --dir (access, blocked), folders (their access.log*), '
-                         'files or globs; several are read together (default: access)')
+    ap.add_argument('logs', nargs='*',
+                    help='log names in --dir (access, blocked), folders (their access.log* and blocked.log*), '
+                         'files or globs; several are read together (default: access and blocked)')
     ap.add_argument('--dir', default=LOG_DIR, help=f'log folder (default: {LOG_DIR}, or $NGINX_LOG_DIR)')
     ap.add_argument('--days', type=int, help='only the last N days')
     ap.add_argument('--host', help='only this site, e.g. dmtr.org')
     ap.add_argument('--url', help='only this path, e.g. /index.php')
     ap.add_argument('--ip', help='only this client IP')
+    ap.add_argument('--net', help='only this network, e.g. 45.148.10.0/24 or 2601:2c3:ca00:b4b0::/64')
     ap.add_argument('--status', type=int, help='only this status code, e.g. 404')
     ap.add_argument('--bots', action='store_true', help='include bots (crawlers, scanners, scripts, fake browsers)')
     ap.add_argument('--pages', action='store_true', help='leave out static files (css, js, images, fonts)')
@@ -1165,17 +1318,19 @@ def main():
     ap.add_argument('--top', type=int, help='rows per table (default: 20 in --text, 50 in --dump)')
     args = ap.parse_args()
 
-    files = log_files(args.logs, args.dir)
+    files = log_files(args.logs or ['access', 'blocked'], args.dir, () if args.logs else ('blocked',))
     if not files:
         sys.exit('no log files found')
     filters = [(f, v) for f, v in ((HOST, args.host and args.host.lower()), (PATH, args.url),
-                                   (IP, args.ip), (STATUS, args.status)) if v is not None]
+                                   (IP, args.ip), (NET, args.net and network(args.net.split('/')[0])),
+                                   (STATUS, args.status)) if v is not None]
     folders = {os.path.dirname(os.path.realpath(f)) for f in files}
     if len(folders) > 1:
         source = f'{len(files)} files in {len(folders)} folders'
     else:
-        name = os.path.basename(files[-1])
-        source = f'{name}*' if len(files) > 1 else name
+        names = sorted({re.sub(r'\.log.*', '.log', os.path.basename(f)) for f in files})
+        source = ' + '.join(n + ('*' if sum(os.path.basename(f).startswith(n) for f in files) > 1 else '')
+                            for n in names)
     if args.days:
         source += f'  last {args.days} day' + ('s' if args.days > 1 else '')
 
