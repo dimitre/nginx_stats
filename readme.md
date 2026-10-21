@@ -3,12 +3,14 @@
 Most accessed URLs, referrers, sites, IPs, status codes and user agents from
 nginx access logs, in an interactive terminal view with bar charts.
 
-Python 3 standard library only: nothing to install. Reads all rotated logs
-(`access.log`, `access.log.1`, `access.log.2.gz`...) from `/var/log/nginx`,
-so it runs from anywhere, e.g. `/srv/server/nginx_stats`.
+Python 3 standard library only: nothing to install. Reads the latest logs
+(`access.log`, `access.log.1`) from `/var/log/nginx`, so it runs from
+anywhere, e.g. `/srv/server/nginx_stats`. The history (`access.log.2.gz`...)
+is read with `--all`, with `--days N`, or by pressing `a` in the view.
 
 ```sh
 ./nginx_stats.py                        # interactive, access.log* + blocked.log*
+./nginx_stats.py --all                  # the .gz history too
 ./nginx_stats.py access                 # only access.log* (or: blocked)
 ./nginx_stats.py --days 1 --host dmtr.org
 ./nginx_stats.py --pages                # leave out css, js, images, fonts
@@ -37,7 +39,9 @@ Several sources are read together, e.g. current logs plus another server's:
 ```
 
 Each source is a log name in `--dir` (`access`, `blocked`), a folder (its
-`access.log*` and `blocked.log*`), a file or a glob. A file reached twice is read once. Keep other servers' logs out of
+`access.log*` and `blocked.log*`), a file or a glob. A file reached twice is read once.
+`.gz` files given by hand (files or globs) are always read; found by name or
+folder, only with `--all`, unless there is nothing else. Keep other servers' logs out of
 `/var/log/nginx`: logrotate renames and deletes numbered files there.
 
 Default folder: `--dir /path` or `NGINX_LOG_DIR=/path`.
@@ -53,6 +57,7 @@ Default folder: `--dir /path` or `NGINX_LOG_DIR=/path`.
 | `/` | search in the current panel (`esc` clears) |
 | `b` | show / hide bots (see below). Hidden by default |
 | `p` | pages only: leave out static files |
+| `a` | history: read the older `.gz` logs too (again: latest only) |
 | `r` | read the logs again |
 | `q` | quit |
 

@@ -2,11 +2,13 @@
 """
 nginx_stats: most accessed URLs, referrers, hosts, IPs... from nginx logs.
 
-Reads every rotated file (access.log, access.log.1, access.log.2.gz...) in
-/var/log/nginx and opens an interactive view in the terminal. Python 3
+Reads the latest logs (access.log, access.log.1) in /var/log/nginx, or every
+rotated file with --all (access.log.2.gz...), and opens an interactive view
+in the terminal. Python 3
 standard library only, so it runs as is on any server.
 
     ./nginx_stats.py                       interactive, access.log* + blocked.log*
+    ./nginx_stats.py --all                 the .gz history too (key a in the view)
     ./nginx_stats.py access                only access.log* (blocked: only blocked.log*)
     ./nginx_stats.py /var/log/nginx /srv/logs/oldserver   both folders together
     ./nginx_stats.py --days 1 --host dmtr.org
@@ -279,19 +281,22 @@ class Unparsed:
 def log_files(sources, directory, optional=()):
     """Files for each source: a name in directory (access, blocked), a folder
     (its access.log* and blocked.log*), a file or a glob. Oldest rotation first,
-    no repeats. Sources in optional may be missing without a warning."""
+    no repeats. Sources in optional may be missing without a warning. Also
+    returns the history: .gz files found by name or folder (files and globs
+    given by hand always count as latest)."""
     def rotation(f):
         m = re.search(r'\.(\d+)(\.gz)?$', f)
         return int(m.group(1)) if m else 0
 
-    files, seen = [], set()
+    files, seen, history = [], set(), set()
     for src in sources:
+        by_hand = False
         if os.path.isdir(src):
             found = glob.glob(os.path.join(src, 'access.log*')) + glob.glob(os.path.join(src, 'blocked.log*'))
         elif os.path.isfile(src):
-            found = [src]
+            found, by_hand = [src], True
         elif os.sep in src:
-            found = glob.glob(src)
+            found, by_hand = glob.glob(src), True
         else:
             found = glob.glob(os.path.join(directory, src + '.log*'))
         if not found and src not in optional:
@@ -301,7 +306,9 @@ def log_files(sources, directory, optional=()):
             if real not in seen and os.path.isfile(f):
                 seen.add(real)
                 files.append(f)
-    return files
+                if f.endswith('.gz') and not by_hand:
+                    history.add(f)
+    return files, history
 
 
 def load(files, days=None, progress=None):
@@ -653,7 +660,7 @@ def bot_summary(why, n=3):
 
 # --- interactive view ------------------------------------------------------
 
-KEYS = '←→ panel  ↑↓ move  ⏎ filter by row  ⌫ undo filter  / search  b bots  p pages only  r reload  q quit'
+KEYS = '←→ panel  ↑↓ move  ⏎ filter by row  ⌫ undo filter  / search  b bots  p pages only  a history  r reload  q quit'
 
 
 class UI:
@@ -768,6 +775,11 @@ class UI:
             self.message('reading logs…')
             app.reload()
             self.changed()
+        elif key == 'a' and app.history:
+            app.all = not app.all
+            self.message(f'reading {len(app.files)} log files…')
+            app.reload()
+            self.changed()
         self.cursor[self.panel] = max(self.cursor[self.panel], 0)
 
     def changed(self):
@@ -790,6 +802,8 @@ class UI:
         what += '  (bots included)' if app.bots else f'  ({st.bots:,} bots hidden)'
         if app.pages:
             what += '  pages only'
+        if app.left_out:
+            what += '  latest logs only'
         self.put(0, 0, what.ljust(w), self.c('title') | curses.A_BOLD)
 
         x = 1
@@ -863,7 +877,8 @@ class UI:
         info = [
             ('Requests', f'{st.total:,}', 'Unique IPs', f'{st.ips:,}'),
             ('Data sent', human(st.bytes), 'Period', period),
-            ('Files', f'{len(app.files)}', 'Invalid lines', invalid),
+            ('Files', f'{len(app.files)}' + (f' (+{app.left_out} .gz: a)' if app.left_out else ''),
+             'Invalid lines', invalid),
         ]
         for a, b, c, d in info:
             self.put(y, 2, a, self.c('accent'))
@@ -936,6 +951,7 @@ def report(app, top):
           + (f'{days[0]} → {days[-1]}' if days else 'no days')
           + (' · bots included' if app.bots else f' · {st.bots:,} bots hidden')
           + (' · pages only' if app.pages else '')
+          + (f' · latest logs only ({app.left_out} .gz left out, --all: read them)' if app.left_out else '')
           + f' · {app.bad.total:,} invalid lines' + (' (--unparsed: why)' if app.bad.total else ''))
     print('status ' + '  '.join(f'{c}xx {pct(st.status.get(c, 0), st.total).strip()}' for c in (2, 3, 4, 5)))
     if st.bots:
@@ -1035,6 +1051,8 @@ def dump(app, top, path):
               f'Bots are left out of the main tables ({st.bots:,} requests); they have their own section.'))
     if app.pages:
         w('- Static files (css, js, images, fonts) are left out.')
+    if app.left_out:
+        w(f'- Only the latest logs: {app.left_out} older rotated .gz files are left out.')
     if app.filters:
         w('- Only requests with ' + ', '.join(f'{FIELD_NAMES[f]} = {label(f, v)}' for f, v in app.filters) + '.')
     w('- URLs are paths without query strings. "Sites" and "Referrers" are external referrers only.')
@@ -1272,12 +1290,22 @@ def finish(out, path, app):
 # --- main ------------------------------------------------------------------
 
 class App:
-    def __init__(self, files, days, filters, bots, pages, source, quiet=False):
-        self.files, self.days, self.filters = files, days, filters
+    def __init__(self, files, history, all, days, filters, bots, pages, source, quiet=False):
+        self.all_files, self.history, self.days, self.filters = files, history, days, filters
+        # nothing but .gz (a folder of old logs): read them all the same
+        self.all = all or not any(f not in history for f in files)
         self.bots, self.pages, self.source = bots, pages, source
         self.quiet = quiet
         self.known = KnownHosts()
         self.reload()
+
+    @property
+    def files(self):
+        return [f for f in self.all_files if self.all or f not in self.history]
+
+    @property
+    def left_out(self):
+        return len(self.all_files) - len(self.files)
 
     def reload(self):
         quiet = self.quiet or not sys.stderr.isatty()
@@ -1303,7 +1331,9 @@ def main():
                     help='log names in --dir (access, blocked), folders (their access.log* and blocked.log*), '
                          'files or globs; several are read together (default: access and blocked)')
     ap.add_argument('--dir', default=LOG_DIR, help=f'log folder (default: {LOG_DIR}, or $NGINX_LOG_DIR)')
-    ap.add_argument('--days', type=int, help='only the last N days')
+    ap.add_argument('--all', action='store_true',
+                    help='also read the history: rotated .gz files (default: only access.log, access.log.1...)')
+    ap.add_argument('--days', type=int, help='only the last N days (reads the .gz files it needs, like --all)')
     ap.add_argument('--host', help='only this site, e.g. dmtr.org')
     ap.add_argument('--url', help='only this path, e.g. /index.php')
     ap.add_argument('--ip', help='only this client IP')
@@ -1318,7 +1348,7 @@ def main():
     ap.add_argument('--top', type=int, help='rows per table (default: 20 in --text, 50 in --dump)')
     args = ap.parse_args()
 
-    files = log_files(args.logs or ['access', 'blocked'], args.dir, () if args.logs else ('blocked',))
+    files, history = log_files(args.logs or ['access', 'blocked'], args.dir, () if args.logs else ('blocked',))
     if not files:
         sys.exit('no log files found')
     filters = [(f, v) for f, v in ((HOST, args.host and args.host.lower()), (PATH, args.url),
@@ -1338,7 +1368,7 @@ def main():
     locale.setlocale(locale.LC_ALL, '')
     UNICODE = 'UTF' in locale.getpreferredencoding().upper()
 
-    app = App(files, args.days, filters, args.bots, args.pages, source)
+    app = App(files, history, args.all or bool(args.days), args.days, filters, args.bots, args.pages, source)
     if args.unparsed:
         unparsed_report(app)
         return
